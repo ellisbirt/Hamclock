@@ -107,7 +107,8 @@ matched to `STATION_CALL`, not the receiver or cluster login. Reports from
 unknown receivers count as unmapped and **do not get invented locations**.
 No reports can appear until your station is actually heard by a receiver.
 Direct RBN relays have no server-side filters; the app filters locally and
-uses bounded buffers/work per loop. For busy feeds, a filtered downstream
+uses bounded buffers/work per loop. RBN DNS, connection and reads run in a
+worker task, with a bounded queue feeding the display loop. For busy feeds, a filtered downstream
 cluster is preferable; excessive traffic may be dropped. See
 [RBN telnet service guidance](https://www.reversebeacon.net/pages/Telnet+servers+30).
 Telnet is unencrypted; use only your public radio callsign, never a password.

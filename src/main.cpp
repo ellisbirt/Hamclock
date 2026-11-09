@@ -3,6 +3,7 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <atomic>
 #include <time.h>
 #include "config.h"
 #include "radio_data.h"
@@ -17,6 +18,9 @@ TFT_eSprite ui(&tft);
 WiFiUDP udp;
 WiFiClient rbn;
 SemaphoreHandle_t solarMutex;
+QueueHandle_t beaconQueue = nullptr;
+std::atomic<bool> rbnOnline{false};
+struct BeaconLine { char text[256]; };
 std::string pendingSolar;
 radio::Solar solarData;
 bool solarReady = false, udpReady = false, displayReady = false;
@@ -164,7 +168,11 @@ void serviceRbn() {
     for (int budget = 0; budget < 2048 && rbn.available(); ++budget) {
         char c = rbn.read();
         if (c == '\n') {
-            if (!rbnOverflow) receiveBeacon(rbnLine);
+            if (!rbnOverflow) {
+                BeaconLine line{};
+                memcpy(line.text, rbnLine.c_str(), rbnLine.size());
+                xQueueSend(beaconQueue, &line, 0);
+            }
             rbnLine.clear();
             rbnOverflow = false;
         } else if (c != '\r' && static_cast<unsigned char>(c) >= 32 &&
@@ -178,6 +186,22 @@ void serviceRbn() {
             }
         }
     }
+}
+
+void rbnTask(void *) {
+    for (;;) {
+        if (WiFi.status() == WL_CONNECTED) serviceRbn();
+        else rbn.stop();
+        rbnOnline.store(rbn.connected());
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void receiveRbn() {
+    if (!beaconQueue) return;
+    BeaconLine line;
+    for (int budget = 0; budget < 8 && xQueueReceive(beaconQueue, &line, 0) == pdTRUE; ++budget)
+        receiveBeacon(line.text);
 }
 
 int mapLon(float lon) {
@@ -301,7 +325,7 @@ void drawHeat() {
     text("RBN: receivers hearing " + String(STATION_CALL), 8, 30, TFT_YELLOW, 1);
     if (!RBN_ENABLED) text("RBN disabled: configure call / skimmers", 8, 194, TFT_YELLOW, 1);
     else if (!radio::callsign(STATION_CALL)) text("Set a valid STATION_CALL to use RBN", 8, 194, TFT_RED, 1);
-    else text(String(mapped) + " mapped/1h  " + (rbn.connected() ? "Connected" : "Reconnecting"),
+    else text(String(mapped) + " mapped/1h  " + (rbnOnline.load() ? "Connected" : "Reconnecting"),
               8, 194, TFT_LIGHTGREY, 1);
     text("Unmapped " + String(unmapped) + " / " + String(reports) + " total since boot", 8, 207, TFT_LIGHTGREY, 1);
     text("Cell reports: yellow 1-2 / orange 3-7 / red 8+", 8, 219, TFT_LIGHTGREY, 1);
@@ -329,7 +353,6 @@ void draw() {
 void serviceWifi() {
     if (WiFi.status() != WL_CONNECTED) {
         if (udpReady) { udp.stop(); udpReady = false; }
-        rbn.stop();
         if (radio::expired(millis(), lastWifi, 30000)) {
             lastWifi = millis();
             WiFi.reconnect();
@@ -346,7 +369,6 @@ void serviceWifi() {
         }
     }
     if (udpReady) receiveWsjtx();
-    serviceRbn();
 }
 } // namespace
 
@@ -379,6 +401,15 @@ void setup() {
         return;
     }
     lastRbn = millis() - 60000;
+    if (RBN_ENABLED && radio::callsign(STATION_CALL)) {
+        beaconQueue = xQueueCreate(8, sizeof(BeaconLine));
+        if (!beaconQueue || xTaskCreate(rbnTask, "rbn", 4096, nullptr, 1, nullptr) != pdPASS) {
+            Serial.println("RBN worker allocation failed");
+            displayReady = false;
+            tft.drawString("RBN worker allocation failed", 8, 8, 2);
+            return;
+        }
+    }
     draw();
 }
 
@@ -386,6 +417,7 @@ void loop() {
     if (!displayReady) { delay(1000); return; }
     serviceWifi();
     receiveSolar();
+    receiveRbn();
     static bool touching = false;
     static uint32_t lastTap = 0;
     bool pressed = digitalRead(36) == LOW;
